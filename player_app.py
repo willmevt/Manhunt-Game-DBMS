@@ -1,11 +1,3 @@
-"""
-player_app.py — backend functions for player-facing use cases:
-Account, Friends, Transfer (host/join game), and History.
-
-All database access here goes through db.py's primitives; no direct
-psycopg2 usage lives in this module.
-"""
-
 import random
 import string
 
@@ -255,6 +247,114 @@ def list_open_games():
         WHERE g.status = 'pending'
         ORDER BY g.game_id DESC;
         """
+    )
+
+
+# ==================== Live Game Activity ====================
+
+def list_my_active_games(player_id):
+    """(columns, rows) of games the player is currently part of (pending/active)."""
+    return db.run_query(
+        """
+        SELECT g.game_id, g.invite_code, g.status, gp.role,
+               g.center_lat, g.center_lng, gb.initial_radius, gb.name AS build_name
+        FROM game_participant gp
+        JOIN game g ON g.game_id = gp.game_id
+        JOIN game_build gb ON gb.build_id = g.build_id
+        WHERE gp.player_id = %s AND g.status IN ('pending', 'active')
+        ORDER BY g.game_id DESC;
+        """,
+        (player_id,),
+    )
+
+
+def list_other_participants(game_id, player_id):
+    """(columns, rows) of the other players in a game — feeds the "tag target" dropdown."""
+    return db.run_query(
+        """
+        SELECT p.player_id, p.username
+        FROM game_participant gp
+        JOIN player p ON p.player_id = gp.player_id
+        WHERE gp.game_id = %s AND gp.player_id != %s
+        ORDER BY p.username;
+        """,
+        (game_id, player_id),
+    )
+
+
+def list_power_ups_for_role(role):
+    """(columns, rows) of power-ups usable by the given participant_role."""
+    return db.run_query(
+        """
+        SELECT power_up_id, name, effect_type, duration, cooldown_sec
+        FROM power_up
+        WHERE available_to = %s OR available_to = 'both'
+        ORDER BY name;
+        """,
+        (role,),
+    )
+
+
+def _jitter_point(center_lat, center_lng, radius_m):
+    """A random point within radius_m meters of the given center (same formula as seed_data.py)."""
+    lat = center_lat + random.uniform(-radius_m, radius_m) / 111_000
+    lng = center_lng + random.uniform(-radius_m, radius_m) / 111_000
+    return round(lat, 6), round(lng, 6)
+
+
+def log_location_ping(game_id, player_id, center_lat, center_lng, radius_m):
+    """Insert a LOCATION_PING event near the game's center."""
+    lat, lng = _jitter_point(float(center_lat), float(center_lng), radius_m)
+    db.run_command(
+        """
+        INSERT INTO game_event (latitude, longitude, game_id, player_id, event_type_code)
+        VALUES (%s, %s, %s, %s, 'LOCATION_PING');
+        """,
+        (lat, lng, game_id, player_id),
+    )
+
+
+def log_tag(game_id, tagger_id, target_id, center_lat, center_lng, radius_m):
+    """Insert a TAG event. Logging only — does not mutate game_participant/game state."""
+    if tagger_id == target_id:
+        raise ValueError("You cannot tag yourself.")
+    lat, lng = _jitter_point(float(center_lat), float(center_lng), radius_m)
+    db.run_command(
+        """
+        INSERT INTO game_event (latitude, longitude, game_id, player_id, target_player_id, event_type_code)
+        VALUES (%s, %s, %s, %s, %s, 'TAG');
+        """,
+        (lat, lng, game_id, tagger_id, target_id),
+    )
+
+
+def log_power_up_use(game_id, player_id, power_up_id):
+    """Insert a POWER_UP_USE event (no lat/lng, matching seed_data.py's convention)."""
+    db.run_command(
+        """
+        INSERT INTO game_event (game_id, player_id, power_up_id, event_type_code)
+        VALUES (%s, %s, %s, 'POWER_UP_USE');
+        """,
+        (game_id, player_id, power_up_id),
+    )
+
+
+def list_recent_game_events(game_id, limit=30):
+    """(columns, rows) of the most recent events for a game — feeds the live event feed table."""
+    return db.run_query(
+        """
+        SELECT ge.event_id, ge.event_type_code, actor.username AS player,
+               target.username AS target_player, ge.latitude, ge.longitude,
+               ge.event_time, pu.name AS power_up
+        FROM game_event ge
+        LEFT JOIN player actor ON actor.player_id = ge.player_id
+        LEFT JOIN player target ON target.player_id = ge.target_player_id
+        LEFT JOIN power_up pu ON pu.power_up_id = ge.power_up_id
+        WHERE ge.game_id = %s
+        ORDER BY ge.event_time DESC
+        LIMIT %s;
+        """,
+        (game_id, limit),
     )
 
 

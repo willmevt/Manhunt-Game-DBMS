@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import QDate
 
 import admin_app
-
+import styles
 
 def populate_table(table: QTableWidget, columns, rows):
     """Fill a QTableWidget with the given column headers and row tuples."""
@@ -354,6 +354,7 @@ class AdminMainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    styles.apply_theme(app)
     window = AdminMainWindow()
     window.show()
     sys.exit(app.exec())

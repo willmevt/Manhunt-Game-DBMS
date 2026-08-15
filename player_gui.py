@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 
 import db
 import player_app
-
+import styles
 
 def populate_table(table: QTableWidget, columns, rows):
     """ Fill QTableWidget with given column headers and row tuples."""
@@ -360,6 +360,7 @@ class TransferTab(QWidget):
     def __init__(self, player_id):
         super().__init__()
         self.player_id = player_id
+        self._active_games = {}
         self._build_ui()
         self._connect_signals()
         self.refresh()
@@ -400,6 +401,31 @@ class TransferTab(QWidget):
         join_form.addRow("Your Role:", self.join_role_combo)
         join_form.addRow(self.join_btn)
         left_layout.addWidget(join_group)
+
+        live_group = QGroupBox("Live Game Activity")
+        live_layout = QVBoxLayout(live_group)
+        live_layout.addWidget(QLabel("Active Game:"))
+        self.active_game_combo = QComboBox()
+        live_layout.addWidget(self.active_game_combo)
+
+        self.ping_btn = QPushButton("Send Location Ping")
+        live_layout.addWidget(self.ping_btn)
+
+        target_row = QHBoxLayout()
+        self.target_combo = QComboBox()
+        self.tag_btn = QPushButton("Tag Selected Player")
+        target_row.addWidget(self.target_combo)
+        target_row.addWidget(self.tag_btn)
+        live_layout.addLayout(target_row)
+
+        power_up_row = QHBoxLayout()
+        self.power_up_combo = QComboBox()
+        self.use_power_up_btn = QPushButton("Use Selected Power-Up")
+        power_up_row.addWidget(self.power_up_combo)
+        power_up_row.addWidget(self.use_power_up_btn)
+        live_layout.addLayout(power_up_row)
+
+        left_layout.addWidget(live_group)
         left_layout.addStretch()
 
         right_layout = QVBoxLayout()
@@ -411,6 +437,12 @@ class TransferTab(QWidget):
         self.refresh_btn = QPushButton("Refresh")
         right_layout.addWidget(self.refresh_btn)
 
+        right_layout.addWidget(QLabel("Recent Game Events"))
+        self.events_table = QTableWidget(0, 0)
+        self.events_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.events_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        right_layout.addWidget(self.events_table)
+
         layout.addWidget(left_widget, 1)
         layout.addLayout(right_layout, 2)
 
@@ -418,6 +450,10 @@ class TransferTab(QWidget):
         self.host_btn.clicked.connect(self.on_host)
         self.join_btn.clicked.connect(self.on_join)
         self.refresh_btn.clicked.connect(self.refresh)
+        self.active_game_combo.currentIndexChanged.connect(self._on_active_game_changed)
+        self.ping_btn.clicked.connect(self.on_ping)
+        self.tag_btn.clicked.connect(self.on_tag)
+        self.use_power_up_btn.clicked.connect(self.on_use_power_up)
 
     def _reload_builds(self):
         self.build_combo.clear()
@@ -425,6 +461,51 @@ class TransferTab(QWidget):
         for row in rows:
             build_id, name = row[0], row[1]
             self.build_combo.addItem(name, userData=build_id)
+
+    def _reload_active_games(self):
+        previous_game_id = self.active_game_combo.currentData()
+
+        self.active_game_combo.blockSignals(True)
+        self.active_game_combo.clear()
+        self._active_games = {}
+        _, rows = player_app.list_my_active_games(self.player_id)
+        for row in rows:
+            game_id, invite_code, status, role, center_lat, center_lng, initial_radius, build_name = row
+            self._active_games[game_id] = row
+            self.active_game_combo.addItem(f"{invite_code} ({status}) — {build_name}", userData=game_id)
+
+        index = self.active_game_combo.findData(previous_game_id)
+        if index == -1 and self.active_game_combo.count():
+            index = 0
+        self.active_game_combo.setCurrentIndex(index)
+        self.active_game_combo.blockSignals(False)
+
+        self._on_active_game_changed()
+
+    def _on_active_game_changed(self):
+        game_id = self.active_game_combo.currentData()
+
+        self.target_combo.clear()
+        self.power_up_combo.clear()
+
+        if game_id is None:
+            populate_table(self.events_table, [], [])
+            return
+
+        _, participant_rows = player_app.list_other_participants(game_id, self.player_id)
+        for pid, username in participant_rows:
+            self.target_combo.addItem(username, userData=pid)
+
+        role = self._active_games[game_id][3]
+        _, power_up_rows = player_app.list_power_ups_for_role(role)
+        for power_up_id, name, effect_type, duration, cooldown_sec in power_up_rows:
+            self.power_up_combo.addItem(name, userData=power_up_id)
+
+        self._load_events(game_id)
+
+    def _load_events(self, game_id):
+        columns, rows = player_app.list_recent_game_events(game_id)
+        populate_table(self.events_table, columns, rows)
 
     def on_host(self):
         build_id = self.build_combo.currentData()
@@ -456,10 +537,54 @@ class TransferTab(QWidget):
         except Exception as e:
             QMessageBox.warning(self, "Join Failed", str(e))
 
+    def on_ping(self):
+        game_id = self.active_game_combo.currentData()
+        if game_id is None:
+            QMessageBox.information(self, "No Active Game", "You have no pending/active games to interact with.")
+            return
+        _, _, _, _, center_lat, center_lng, initial_radius, _ = self._active_games[game_id]
+        try:
+            player_app.log_location_ping(game_id, self.player_id, center_lat, center_lng, initial_radius)
+            self._load_events(game_id)
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", str(e))
+
+    def on_tag(self):
+        game_id = self.active_game_combo.currentData()
+        target_id = self.target_combo.currentData()
+        if game_id is None:
+            QMessageBox.information(self, "No Active Game", "You have no pending/active games to interact with.")
+            return
+        if target_id is None:
+            QMessageBox.information(self, "No Target", "There is no one else in this game to tag.")
+            return
+        _, _, _, _, center_lat, center_lng, initial_radius, _ = self._active_games[game_id]
+        try:
+            player_app.log_tag(game_id, self.player_id, target_id, center_lat, center_lng, initial_radius)
+            self._load_events(game_id)
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", str(e))
+
+    def on_use_power_up(self):
+        game_id = self.active_game_combo.currentData()
+        power_up_id = self.power_up_combo.currentData()
+        if game_id is None:
+            QMessageBox.information(self, "No Active Game", "You have no pending/active games to interact with.")
+            return
+        if power_up_id is None:
+            QMessageBox.information(self, "No Power-Up", "No power-ups are available for your role.")
+            return
+        try:
+            player_app.log_power_up_use(game_id, self.player_id, power_up_id)
+            self._load_events(game_id)
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", str(e))
+
     def refresh(self):
         self._reload_builds()
         columns, rows = player_app.list_open_games()
         populate_table(self.games_table, columns, rows)
+        self._reload_active_games()
 
 # ===================================================== #
 #                      History Tab                      #
@@ -547,6 +672,7 @@ class PlayerMainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    styles.apply_theme(app)
 
     login = LoginDialog()
     if login.exec() != QDialog.Accepted:
